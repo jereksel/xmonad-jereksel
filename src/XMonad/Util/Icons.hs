@@ -1,6 +1,7 @@
 module XMonad.Util.Icons (
     getIcons,
-    xmobarIconWrapper
+    xmobarIconWrapper,
+    rgbaToXPM
 ) where
 
 import XMonad
