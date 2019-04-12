@@ -1,7 +1,9 @@
+{-# LANGUAGE ScopedTypeVariables #-}
 module XMonad.Util.Icons (
     getIcons,
     xmobarIconWrapper,
-    rgbaToXPM
+    rgbaToXPM,
+    pixelToString
 ) where
 
 import XMonad
@@ -13,6 +15,8 @@ import XMonad.Hooks.DynamicLog
 import XMonad.Actions.PhysicalScreens
 import XMonad.Hooks.SetWMName
 
+import qualified Data.Foldable as F
+
 import Foreign.C.String (castCCharToChar)
 
 import Foreign.C.Types
@@ -21,6 +25,12 @@ import System.Directory
 
 import XMonad.Actions.Minimize
 import XMonad.Layout.Minimize
+
+import qualified GI.Gtk as Gtk (init)
+import qualified GI.Gtk
+import qualified Data.Text as T
+import           GI.Gtk.Objects.IconTheme
+import           GI.GdkPixbuf.Objects.Pixbuf
 
 import qualified XMonad.Layout.BoringWindows as BW
 
@@ -42,11 +52,17 @@ import Data.Bits
 import Data.Vector.Storable (fromList)
 import qualified Data.Vector.Storable as V
 import Data.List
+import qualified Data.List as L
 import Data.Ord
 import Data.Maybe
 
 import Numeric (showHex)
-
+import qualified GI.Gtk as Gtk (init)
+import qualified GI.Gtk
+import qualified Data.ByteString as B
+import qualified Data.ByteString.Char8 as BS
+import Vision.Image.Storage.DevIL
+import Vision.Image.Storage.DevIL.ImageType
 import Vision.Image.RGBA
 import Vision.Image.Type
 import Vision.Primitive
@@ -58,7 +74,13 @@ import Data.List.Split
 
 import Control.Monad (mfilter)
 
-import Data.Text (justifyLeft, pack, unpack)
+import Data.Text (justifyRight, pack, unpack)
+
+themeLoadFlags :: [GI.Gtk.IconLookupFlags]
+themeLoadFlags =
+  [ GI.Gtk.IconLookupFlagsGenericFallback
+  , GI.Gtk.IconLookupFlagsUseBuiltin
+  ]
 
 data Icon = Icon {
   width :: Int,
@@ -70,9 +92,9 @@ pixelToString :: RGBAPixel -> String
 pixelToString pixel
   | alpha < 200 = "000000"
   | otherwise = do
-        let red = unpack $ justifyLeft 2 '0' $ pack $ showHex (rgbaRed pixel) ""
-        let green = unpack $ justifyLeft 2 '0' $ pack $ showHex (rgbaGreen pixel) ""
-        let blue = unpack $ justifyLeft 2 '0' $ pack $ showHex (rgbaBlue pixel) ""
+        let red = unpack $ justifyRight 2 '0' $ pack $ showHex (rgbaRed pixel) ""
+        let green = unpack $ justifyRight 2 '0' $ pack $ showHex (rgbaGreen pixel) ""
+        let blue = unpack $ justifyRight 2 '0' $ pack $ showHex (rgbaBlue pixel) ""
         red ++ green ++ blue
    where alpha = rgbaAlpha pixel
 
@@ -111,7 +133,7 @@ rgbaToXPM icon = do
 iconToRGBA :: Icon -> RGBA
 iconToRGBA x = Manifest size vector
   where
-    size = ix2 (height x) (width x) :: Size
+    size = ix2 (height x) (width x)
     vector = fromList $ map intToRGBA (rgba x)
 
 resizeImage :: RGBA -> RGBA
@@ -126,10 +148,8 @@ intToRGBA x = RGBAPixel
 
 getIconFromArr :: [Foreign.C.Types.CLong] -> Icon
 getIconFromArr arr = do
-  let integers = map fromIntegral arr
-  let width = integers!!0
-  let height = integers!!1
-  let rgba = take (width * height) $ drop 2 integers
+  let (width:height:integers) = map fromIntegral arr
+  let rgba = take (width * height) integers
   Icon width height rgba
 
 getIcon :: Window -> X (Maybe Icon)
@@ -141,23 +161,46 @@ getIcon win = withDisplay $ \dpy -> do
 getDistinctValues :: Icon -> Int
 getDistinctValues icon = length $ nub $ rgba icon
 
-replace a b = map $ maybe b id . mfilter (/= a) . Just
-
-pureX :: a -> X a
-pureX = pure
-
-getWindowClass :: Window -> X (Maybe String)
-getWindowClass win = withDisplay $ \dpy -> do
+getWindowClasses :: Window -> X (Maybe [String])
+getWindowClasses win = withDisplay $ \dpy -> do
   chars <- io $ getWindowProperty8 dpy wM_CLASS win
-  pure $ replace '\x0' '_' . map castCCharToChar <$> chars
+  pure $ L.filter (not . null) . splitOn ['\x0'] . map castCCharToChar <$> chars
+
+getThemeIcon :: String -> IO (Maybe RGBA)
+getThemeIcon name = do
+  _ <- Gtk.init Nothing
+  iconTheme <- iconThemeGetDefault
+  let iconNameText = T.pack name
+  iconExists <- iconThemeHasIcon iconTheme iconNameText
+  case iconExists of 
+    True -> do
+      iconMaybe <- iconThemeLoadIcon iconTheme iconNameText 16 themeLoadFlags
+      case iconMaybe of 
+        Just icon -> do 
+          bmp <- pixbufSaveToBufferv icon (T.pack "bmp") [] []
+          let file = "/tmp/" ++ name ++ ".bmp"
+          B.writeFile file bmp
+          loaded <- load BMP file
+          case loaded of
+            Right (rgba :: RGBA) -> pure $ Just rgba
+            Left _ -> pure Nothing
+        Nothing -> pure Nothing
+    False -> pure Nothing
+
+mapIOM :: X (Maybe a) -> (a -> b) -> X (Maybe b)
+mapIOM iom f = do
+  m <- iom
+  pure $ f <$> m
 
 getIconString :: Window -> X (Maybe String)
 getIconString win = do
 
-  maybeClass <- getWindowClass win
+  maybeClasses <- getWindowClasses win
 
-  case maybeClass of
-    Just winClass -> do
+  case maybeClasses of
+    Just winClasses -> do
+
+      let winClass = intercalate "_" winClasses
 
       let fileName = "/tmp/xpms/" ++ winClass ++ ".xpm"
       exists <- io $ doesFileExist fileName
@@ -165,15 +208,20 @@ getIconString win = do
       case exists of
         False -> do
 
-          iconMaybe <- getIcon win
+          let themeIcons = map (io . getThemeIcon) winClasses
+
+          let b = mapIOM (getIcon win) iconToRGBA
+
+          allIcons <- sequence $ themeIcons ++ [b]
+
+          let iconMaybe = F.asum allIcons
 
           case iconMaybe of
 
             Just icon -> do
-              let xpm = rgbaToXPM $ resizeImage $ iconToRGBA icon
+              let xpm = rgbaToXPM $ resizeImage icon
               _ <- io $ writeFile fileName xpm
               pure $ Just fileName
-
             Nothing -> pure Nothing
         True -> pure $ Just fileName
     Nothing -> pure Nothing
