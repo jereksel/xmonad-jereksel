@@ -1,4 +1,5 @@
-{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE EmptyCase #-}
+{-# LANGUAGE ScopedTypeVariables, OverloadedStrings #-}
 module XMonad.Util.Icons (
     getIcons,
     xmobarIconWrapper,
@@ -15,7 +16,14 @@ import XMonad.Hooks.DynamicLog
 import XMonad.Actions.PhysicalScreens
 import XMonad.Hooks.SetWMName
 
+import qualified XMonad.Util.ExtensibleState as XS
+
+import Data.Time.Clock
+import Data.Time.Calendar
+
 import qualified Data.Foldable as F
+
+import Control.Monad (sequence)
 
 import Foreign.C.String (castCCharToChar)
 
@@ -41,6 +49,8 @@ import qualified XMonad.StackSet as W
 import XMonad.StackSet
 
 import XMonad.Hooks.UrgencyHook
+
+import System.Directory (getHomeDirectory)
 
 import XMonad.Layout.NoBorders
 import XMonad.Actions.Warp
@@ -75,6 +85,7 @@ import Data.List.Split
 import Control.Monad (mfilter)
 
 import Data.Text (justifyRight, pack, unpack)
+import           Data.Ini
 
 themeLoadFlags :: [GI.Gtk.IconLookupFlags]
 themeLoadFlags =
@@ -166,10 +177,11 @@ getWindowClasses win = withDisplay $ \dpy -> do
   chars <- io $ getWindowProperty8 dpy wM_CLASS win
   pure $ L.filter (not . null) . splitOn ['\x0'] . map castCCharToChar <$> chars
 
-getThemeIcon :: String -> IO (Maybe RGBA)
-getThemeIcon name = do
-  _ <- Gtk.init Nothing
-  iconTheme <- iconThemeGetDefault
+getThemeIcon :: String -> String -> IO (Maybe RGBA)
+getThemeIcon pack name = do
+  -- _ <- Gtk.init Nothing
+  iconTheme <- iconThemeNew
+  _ <- io $ iconThemeSetCustomTheme iconTheme $ Just $ T.pack pack
   let iconNameText = T.pack name
   iconExists <- iconThemeHasIcon iconTheme iconNameText
   case iconExists of 
@@ -187,10 +199,76 @@ getThemeIcon name = do
         Nothing -> pure Nothing
     False -> pure Nothing
 
+getThemeIconForPacks :: [String] -> String -> IO (Maybe RGBA)
+getThemeIconForPacks (pack:packs) name = do
+  icon <- getThemeIcon pack name
+  case icon of
+    Just i -> pure $ Just i
+    Nothing -> getThemeIconForPacks packs name
+getThemeIconForPacks [] _ = pure Nothing
+
 mapIOM :: X (Maybe a) -> (a -> b) -> X (Maybe b)
 mapIOM iom f = do
   m <- iom
   pure $ f <$> m
+
+getCurrentIconThemeName :: X (Maybe String)
+getCurrentIconThemeName = do
+  _ <- Gtk.init Nothing
+  settings <- GI.Gtk.settingsGetDefault
+  let iconName :: Maybe (X (Maybe T.Text)) = (GI.Gtk.getSettingsGtkIconThemeName <$> settings)
+  case iconName of 
+    Just i -> do
+      iX <- i
+      case iX of 
+        Just iX1 -> pure $ Just $ T.unpack iX1
+        Nothing -> pure Nothing
+    Nothing -> pure Nothing
+
+maybeFromEither :: Either b a -> Maybe a
+maybeFromEither (Right x) = Just x
+maybeFromEither (Left _) = Nothing
+
+getCurrentIconThemeName2 :: X [String]
+getCurrentIconThemeName2 = do
+  ics <- XS.get :: X IconPackState
+  let lc = lastCheck ics
+  let p = packs ics
+  currentTime <- io getCurrentTime
+  let needsUpdate = diffUTCTime currentTime lc > 1
+  case needsUpdate of
+    True -> do
+      homeDir <- io getHomeDirectory
+      let configDir = homeDir ++ "/.config/gtk-3.0/settings.ini"
+      exists <- io $ doesFileExist configDir
+      case exists of 
+        True -> do
+          ini <- io $ readIniFile configDir
+
+          case ini of
+            Right ini -> do
+              let iconTheme = maybeFromEither $ lookupValue "Settings" "gtk-icon-theme-name" ini
+              let fallbackIconTheme = maybeFromEither $ lookupValue "Settings" "gtk-fallback-icon-theme" ini
+              let theme = map unpack $ catMaybes [iconTheme, fallbackIconTheme]
+              _ <- XS.put $ IconPackState currentTime theme
+              pure theme
+            Left _ -> do
+              _ <- XS.put $ IconPackState currentTime p
+              pure p
+
+        False -> do
+          _ <- XS.put $ IconPackState currentTime p
+          pure p
+
+    False -> pure p
+
+data IconPackState = IconPackState {
+  lastCheck :: UTCTime,
+  packs :: [String]
+}
+
+instance ExtensionClass IconPackState where
+  initialValue = IconPackState (UTCTime (fromGregorian 2000 1 1) (secondsToDiffTime 0)) []
 
 getIconString :: Window -> X (Maybe String)
 getIconString win = do
@@ -200,7 +278,13 @@ getIconString win = do
   case maybeClasses of
     Just winClasses -> do
 
-      let winClass = intercalate "_" winClasses
+      -- iconThemeNameMaybe <- getCurrentIconThemeName
+      -- let iconThemeName = maybeToList iconThemeNameMaybe
+
+      iconThemes <- getCurrentIconThemeName2
+
+      -- let iconName :: Maybe (IO (Maybe T.Text)) = (GI.Gtk.getSettingsGtkIconThemeName <$> settings)
+      let winClass = intercalate "_" (winClasses ++ iconThemes)
 
       let fileName = "/tmp/xpms/" ++ winClass ++ ".xpm"
       exists <- io $ doesFileExist fileName
@@ -208,13 +292,11 @@ getIconString win = do
       case exists of
         False -> do
 
-          let themeIcons = map (io . getThemeIcon) winClasses
+          let themeIcons = map (io . getThemeIconForPacks iconThemes) winClasses
 
           let b = mapIOM (getIcon win) iconToRGBA
 
-          allIcons <- sequence $ themeIcons ++ [b]
-
-          let iconMaybe = F.asum allIcons
+          iconMaybe <- fmap F.asum . sequence $ themeIcons ++ [b]
 
           case iconMaybe of
 
