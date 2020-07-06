@@ -1,16 +1,15 @@
-resolver: lts-12.26
+resolver: lts-14.1
 
 packages:
 - .
-- location:
-    git: https://github.com/xmonad/xmonad-contrib
-    commit: v0.14
-  extra-dep: true
-- location:
-    git: https://github.com/xmonad/xmonad
-    commit: v0.14
-  extra-dep: true
-- location:
-    git: https://github.com/RaphaelJ/friday-devil.git
+
+extra-deps:
+  - xmonad-0.15
+  - xmonad-contrib-0.15
+  - git: https://github.com/RaphaelJ/friday-devil.git
     commit: 73181586307a4db93302bfeb9af9ded615e60a07
-  extra-dep: true
+  - text-1.2.4.0
+  - friday-0.2.3.1
+  - containers-0.5.11.0
+  - ratio-int-0.1.2
+  - binary-0.8.8.0
